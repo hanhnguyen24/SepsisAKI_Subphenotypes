@@ -12,6 +12,17 @@ output:
     theme: readable
     code_download: true
 ---
+# This R Markdown document illustrates the analysis pipeline used to identify
+# subphenotypes of sepsis-associated acute kidney injury (SAKI) using
+# proteomic biomarker data.
+#
+# The pipeline includes:
+# - ensemble clustering
+# - cluster validation
+# - survival analysis
+# - pathway enrichment
+# - figure generation
+
 
 ```{r setup, include=FALSE}
 rm(list = ls()); gc()
