@@ -1,0 +1,665 @@
+---
+title: "Clustering"
+author: "HN"
+date: "2025-02-10"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: false
+    df_print: paged
+    theme: readable
+    code_download: true
+---
+
+```{r setup, include=FALSE}
+rm(list = ls()); gc()
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# --- Core tidy tools ---
+library(tidyverse)
+
+# --- Olink & Enrichment ---
+library(OlinkAnalyze)
+library(clusterProfiler)
+library(enrichplot)
+library(GO.db)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+
+# --- Clustering & Validation ---
+library(diceR)
+library(tidyLPA)
+library(cluster)
+library(factoextra)
+library(fpc)
+library(clValid)
+library(umap)
+
+# --- Survival Analysis ---
+library(survival)
+library(survminer)
+
+# --- Tables & Reporting ---
+library(gtsummary)
+library(gt)
+
+# --- Plotting & Layout ---
+library(pheatmap)
+library(ggplot2)
+library(ggplotify)
+library(ggrepel)
+library(ggnewscale)
+library(ggforce)
+library(ggfortify)
+library(patchwork)
+library(cowplot)
+library(EnhancedVolcano)
+
+# --- I/O ---
+library(readxl)
+
+# ------------------------------------------------------------
+# Paths: this Rmd lives in code/, project root is one level up
+# ------------------------------------------------------------
+set.seed(42)
+knitr::opts_knit$set(root.dir = normalizePath("..", winslash = "/"))
+message("Working directory set to: ", getwd())
+
+# Create results/ for all outputs
+dir.create("results", showWarnings = FALSE)
+
+# Helper to save ggplots into results/
+fig_path  <- function(name) file.path("results", name)
+save_plot <- function(p, name, w = 7, h = 5, dpi = 300) {
+  ggplot2::ggsave(filename = fig_path(name), plot = p, width = w, height = h, dpi = dpi)
+}
+
+
+```
+
+# 1) Read the data
+
+```{r read-data}
+outcomes <- c("death.28d","timetodeath.28d","death.90d","timetodeath.90d",
+          "MAKE.7d","MAKE.90d","ICU_LoS","ICU_freedays.28d","ICU_freedays.90d","severeAKI.7d")
+
+
+# Olink + clinical outcomes
+adre_olink_MT <- read.csv("data/ADRENOSS_Olink_Clinical_Final_deid.csv")
+
+# Quick NA scan (console)
+suppressWarnings(print(colSums(is.na(adre_olink_MT[outcomes]))))
+
+# Setup wide biomarker matrix (remove IDs/outcomes)
+wide <- adre_olink_MT %>%
+  dplyr::select(-c("Patient", all_of(outcomes)))
+
+# biomarker list
+biomarker_list_sig <- colnames(wide[,-1]) # keep your naming
+
+# quick dims
+suppressWarnings(print(dim(adre_olink_MT))); 
+suppressWarnings(print(length(biomarker_list_sig))); 
+suppressWarnings(print(dim(wide)))
+
+```
+
+# 2) Clustering
+
+```{r running with k from 2 to 6 for choosing best k}
+nk <- 2:6
+reps <- 50
+alg <- c("sc", "km", "pam", "ap", "gmm", "block", "cmeans", "hdbscan", "nmf", "hc", "som", "diana")
+
+con_file <- "data/clustering/adre_ensemble_consensus_cluster_2to6.RDS"
+if (file.exists(con_file)) {
+  con_clust <- readRDS(con_file)
+} else {
+  con_clust <- consensus_cluster(
+    data = as.matrix(wide[, -1]),
+    nk = nk,
+    reps = reps,
+    algorithms = alg
+  )
+  saveRDS(con_clust , con_file)
+}
+
+eval_file <- "data/clustering//adre_ensemble_eval_wo_trim_2to6.RDS"
+if (file.exists(eval_file)) {
+  con_eval_rslt_wo_trim <- readRDS(eval_file)
+} else {
+  set.seed(42)
+  con_eval_rslt_wo_trim <- consensus_evaluate(
+    data = as.matrix(wide[, -1]), 
+    con_clust, 
+    k.method = NULL,
+    plot = FALSE
+  )
+  saveRDS(con_eval_rslt_wo_trim , eval_file)
+}
+
+# PAC across k
+adre_pac <- tryCatch(rowMeans(con_eval_rslt_wo_trim$pac[,-1]), error = function(e) NA_real_)
+adre_pac
+```
+
+## 2.1 Consensus clustering (k = 2)
+
+```{r clustering-k2}
+nk <- 2
+reps <- 50
+alg <- c("sc","km","pam","ap","gmm","block","cmeans","hdbscan","nmf","hc","som","diana")
+
+con_file <- "data/clustering/adre_ensemble_consensus_cluster.RDS"
+if (file.exists(con_file)) {
+  con_clust <- readRDS(con_file)
+} else {
+  con_clust <- consensus_cluster(
+    data = as.matrix(wide[, -1]),
+    nk = nk,
+    reps = reps,
+    algorithms = alg
+  )
+  saveRDS(con_clust, con_file)
+}
+```
+
+## 2.2 Evaluate (no trim) + keep algorithms
+
+```{r evaluate-no-trim}
+eval_file <- "data/clustering/adre_ensemble_eval_wo_trim.RDS"
+if (file.exists(eval_file)) {
+  con_eval_rslt_wo_trim <- readRDS(eval_file)
+} else {
+  set.seed(42)
+  con_eval_rslt_wo_trim <- consensus_evaluate(
+    data = as.matrix(wide[, -1]),
+    con_clust,
+    k.method = 2,
+    plot = FALSE
+  )
+  saveRDS(con_eval_rslt_wo_trim, eval_file)
+}
+
+algorithms_kept <- con_eval_rslt_wo_trim$trim.obj$alg.keep
+if (is.null(algorithms_kept)) algorithms_kept <- dimnames(con_clust)[[3]]
+
+
+```
+
+## 2.3 Cluster assignments
+
+```{r assignments}
+rds_file <- "data/clustering/adre_ensemble_assignments_deid.RDS"
+if (file.exists(rds_file)) {
+  cluster_results <- readRDS(rds_file)
+} else {
+  cluster_results <- list()
+  ks <- 2:2
+  ensemble_methods <- c("CSPA", "LCA")
+  trim_levels <- "All"
+  combinations <- tidyr::expand_grid(fn = ensemble_methods, trim = trim_levels)
+
+  for (k in ks) {
+    cluster_results[[as.character(k)]] <- apply(combinations, 1, function(x) {
+      fn <- x[["fn"]]
+      args <- list(E = con_clust[, , algorithms_kept, , drop = FALSE])
+      if (fn == "CSPA") {
+        args$k <- k
+      } else {
+        k_names <- dimnames(con_clust)[[4]]
+        k_pos <- which(k_names == as.character(k))
+        if (length(k_pos) == 0) return(NULL)
+        args$E <- args$E[, , , k_pos, drop = FALSE]
+      }
+      cl_assign <- try(do.call(fn, args))
+      if (inherits(cl_assign, "try-error")) return(NULL)
+      setNames(data.frame(cl_assign), paste0(fn, ".", x[["trim"]]))
+    })
+  }
+
+  cluster_results <- lapply(cluster_results, dplyr::bind_cols)
+  cluster_results <- lapply(cluster_results, function(x) dplyr::bind_cols(wide["SampleID"], x))
+  cluster_results <- cluster_results$`2` %>% data.frame()
+  saveRDS(cluster_results, rds_file)
+}
+
+suppressWarnings(print(table(cluster_results$LCA.All)))
+suppressWarnings(print(prop.table(table(cluster_results$LCA.All))))
+```
+
+## 2.4 Heatmap
+
+```{r heatmap}
+heatmap_plot <- wide %>% 
+  column_to_rownames("SampleID") %>% 
+  cbind(., Cluster = cluster_results$LCA.All) %>% 
+  arrange(Cluster) %>% 
+  dplyr::select(-any_of(c("Cluster"))) %>% 
+  pheatmap::pheatmap(., 
+           cluster_rows = FALSE, 
+           gaps_row = sum(cluster_results$LCA.All == 1), 
+           show_rownames = FALSE, 
+           show_colnames = FALSE,
+           color = colorRampPalette(c("blue", "white", "red"))(100))
+
+
+# Convert to ggplot safely for patchwork later
+if (!is.null(heatmap_plot$gtable)) {
+  heatmap_plot_gp <- ggplotify::as.ggplot(heatmap_plot$gtable)
+} else {
+  # Rebuild gtable if needed
+  heatmap_plot2 <- pheatmap::pheatmap(wide %>% column_to_rownames("SampleID"),
+                                      cluster_rows = FALSE, show_rownames = FALSE, show_colnames = FALSE)
+  heatmap_plot_gp <- ggplotify::as.ggplot(heatmap_plot2$gtable)
+}
+
+# Save
+save_plot(heatmap_plot_gp, "heatmap.png", w = 7, h = 7)
+```
+
+## 2.5 Clustering indices + data prep for plots
+```{r Clustering plot}
+biomarker_list_sig <- colnames(wide[,-1])
+
+adre_olink_MT_clustered <- adre_olink_MT %>% 
+  inner_join(cluster_results, by = "SampleID") %>% 
+  dplyr::select(c("SampleID", "CSPA.All", "LCA.All", all_of(biomarker_list_sig), all_of(outcomes)))
+
+wide_clustered <- adre_olink_MT_clustered  %>% 
+  dplyr::select(-c("SampleID", "LCA.All", "CSPA.All", all_of(outcomes))) %>%
+  dplyr::select(where(is.numeric))
+```
+
+# 4) Analysis
+
+
+## 4.1) COMBINED PLOT: PCA + Survival + MAKE90
+
+### 4.1.1) Survival
+
+```{r Survival plot adre}
+cox_vars <- c("death.28d", "timetodeath.28d", "death.90d", "timetodeath.90d")
+
+
+
+adre_cox_df <- adre_olink_MT %>% 
+  dplyr::select(Patient, all_of(cox_vars)) %>% 
+  inner_join(adre_olink_MT %>% dplyr::select(c(SampleID, Patient)), by = "Patient") %>% 
+  inner_join(adre_olink_MT_clustered%>% dplyr::select(c(SampleID, LCA.All)), by = "SampleID") %>% 
+  mutate(Cluster = factor(LCA.All, levels = c(1,2)),
+         timetodeath.90d = case_when(
+           death.90d == 0 & timetodeath.90d <= 90 ~ 90.001,
+           TRUE ~ timetodeath.90d
+         )) %>% 
+  dplyr::select(-c(Patient, SampleID, LCA.All)) 
+
+my_palette <- c("#002395", "#EF4135") 
+
+adre_olink_MT_clustered <- adre_olink_MT_clustered %>% 
+  mutate(Cluster = factor(LCA.All, levels = c(1, 2)))
+
+fit_cl <- survfit(Surv(timetodeath.90d, death.90d) ~ Cluster, data = adre_cox_df)
+cox_fit <- coxph(Surv(timetodeath.90d, death.90d) ~ Cluster,  data = adre_cox_df)
+
+cox_summary <- summary(cox_fit)
+hr <- round(cox_summary$coefficients[1, "exp(coef)"], 2)
+ci_lower <- round(cox_summary$conf.int[1, "lower .95"], 2)
+ci_upper <- round(cox_summary$conf.int[1, "upper .95"], 2)
+p_val <- signif(cox_summary$coefficients[1, "Pr(>|z|)"], 2)
+annotation_text <- paste0(
+  "Log-rank p-value: ", ifelse(p_val < 0.0001, "< 0.001", format.pval(p_val, eps = 1e-3)),
+  "\nHR = ", round(hr, 2), " [", round(ci_lower, 2), ", ", round(ci_upper, 2), "]"
+)
+
+sur_plot <- ggsurvplot(
+  fit_cl,
+  data = adre_cox_df,
+  palette = my_palette,
+  conf.int = TRUE,
+  conf.int.alpha = 0.2,
+  conf.int.style = "ribbon",
+  censor = TRUE,
+  censor.shape = 124,
+  censor.size = 2,
+  risk.table = TRUE,
+  risk.table.col = "strata",
+  risk.table.y.text = FALSE,
+  risk.table.height = 0.3,
+  break.time.by = 15,
+  xlim = c(0, 90),
+  pval = FALSE,
+  size = 1,
+  legend = "none",
+  xlab = "",
+  ylab = "Survival probability",
+  ggtheme = theme_bw(base_size = 12),
+  tables.theme = theme(
+    text = element_text(size = 16, face = "bold", color = "black"),
+    axis.text.x = element_text(size = 18, face = "bold", color = "black"),
+    axis.text.y = element_text(size = 18, face = "bold", color = "black")
+  ),
+  risk.table.fontsize = 8
+)
+
+sur_plot$table <- sur_plot$table +
+  labs(title = "Number at risk", y = NULL) +  
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.position = "none"
+  )
+
+sur_plot$plot <- sur_plot$plot +
+  scale_y_continuous(labels = scales::percent_format()) +
+  annotate("text", x = 5, y = 0.15, label = annotation_text, hjust = 0, size = 7, fontface = "bold", color = "black") +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.6),
+    axis.ticks = element_line(color = "black"),
+    axis.text.x = element_text(color = "black", size = 14),
+    axis.text.y = element_text(color = "black", size = 14),
+    axis.title.x = element_text(size = 14, face = "bold"),
+    axis.title.y = element_text(size = 14, face = "bold"),
+    plot.background = element_rect(fill = "white"),
+    legend.position = "none"
+  ) +
+  labs(x = "Time (days)", y = "Survival probability")
+
+sur_plot$table <- sur_plot$table +
+  labs(title = "Number at risk", y = NULL) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.x = element_blank(),
+    legend.position = "none"
+  )
+
+sur_plot
+```
+
+### 4.1.2) PCA
+
+```{r PCA plot}
+pca_result <- prcomp(adre_olink_MT_clustered %>% 
+                       dplyr::select(-c(SampleID, CSPA.All, LCA.All, Cluster, all_of(outcomes))), scale = TRUE)
+
+# Align PC1 with prior orientation
+pca_result$x[, 1] <- -pca_result$x[, 1]
+pca_result$rotation[, 1] <- -pca_result$rotation[, 1] 
+
+pca_plot <- autoplot(
+  pca_result,
+  data = adre_olink_MT_clustered %>% mutate(Cluster = factor(Cluster)),
+  colour = 'Cluster',
+  shape = 'Cluster',
+  frame = TRUE,
+  frame.type = 'convex',
+  frame.alpha = 0.2,
+  size = 1.5
+) +
+  scale_color_manual(values = my_palette) +        
+  scale_fill_manual(values = my_palette) +         
+  scale_shape_manual(values = c(16, 17)) +        
+  theme_classic() +
+  theme(
+    text = element_text(size = 14),
+    legend.position = "none"
+  )
+
+pca_plot
+```
+
+### 4.1.3) MAKE90
+
+```{r Donut plot for MAKE90}
+donut_data <- adre_olink_MT_clustered %>% 
+  dplyr::filter(!is.na(MAKE.90d)) %>% 
+  mutate(MAKE.90d = ifelse(MAKE.90d == 1, "Y", "N")) %>% 
+  count(Cluster, MAKE.90d) %>%
+  group_by(Cluster) %>%
+  mutate(Percentage = n / sum(n) * 100) %>%
+  ungroup()
+
+chisq_test <- chisq.test(table(adre_olink_MT_clustered$Cluster, adre_olink_MT_clustered$MAKE.90d))
+p_value <- ifelse(chisq_test$p.value < 0.001, "< 0.001", format.pval(chisq_test$p.value, eps = 1e-3))
+
+donut_data <- donut_data %>%
+  mutate(MAKE.90d = factor(MAKE.90d, levels = c("N", "Y"))) %>%
+  arrange(Cluster, MAKE.90d) %>%
+  mutate(Label = paste0(MAKE.90d, "=", n, " (", round(Percentage, 1), "%)"))
+
+cluster_colors <- my_palette
+cluster_shades <- c(
+  scales::alpha(cluster_colors[1], c(0.6, 1)),
+  scales::alpha(cluster_colors[2], c(0.6, 1))
+)
+
+outer_ring <- donut_data %>% filter(Cluster == "1")
+inner_ring <- donut_data %>% filter(Cluster == "2")
+
+donut_plot <- ggplot() +
+  geom_arc_bar(data = outer_ring, aes(x0 = 0, y0 = 0, r0 = 0.8, r = 1.2, fill = Label, amount = Percentage), stat = "pie", color = NA) +
+  scale_fill_manual(values = cluster_shades[1:2], name = "MAKE90") +
+  new_scale_fill() +
+  geom_arc_bar(data = inner_ring, aes(x0 = 0, y0 = 0, r0 = 0.4, r = 0.8, fill = Label, amount = Percentage), stat = "pie", color = NA) +
+  scale_fill_manual(values = cluster_shades[3:4], name = "MAKE90") +
+  coord_fixed() +
+  theme_void() +
+  theme(
+      legend.title = element_text(size = 17, face = "bold"),
+      legend.text = element_text(size = 17),
+      legend.position = "bottom",
+      legend.box = "vertical"
+  ) +
+  annotate("text", x = 0, y = 0, label = paste0("p ", p_value), size = 6, color = "black")
+
+donut_plot
+```
+
+### 4.1.4) Combining plots
+
+```{r Combine Plots}
+my_palette <- c("1"="#002395", "2"="#EF4135")
+
+cohort_name <- "ADRENOSS Cohort"
+n1 <- sum(adre_cox_df$Cluster == "1")
+n2 <- sum(adre_cox_df$Cluster  == "2")
+
+p_label <- ggdraw() +
+  geom_rect(aes(xmin = 0.20, xmax = 0.80, ymin = 0.75, ymax = 0.95), fill = "lightgray", color = "black", size = 0.5) +
+  draw_label("ADRENOSS Cohort", fontface = 'bold', size = 28, x = 0.5, y = 0.85, color = "red") +
+  draw_label(paste0("Subphenotype 1 (n=", n1, ", ", round(n1 / (n1 + n2) * 100), "%)"), fontface = 'bold', size = 20, x = 0.5, y = 0.5, lineheight = 1.3, color = my_palette["1"]) +
+  draw_line(x = c(0.1, 0.2), y = c(0.5, 0.5), color = my_palette["1"], linewidth = 2) +
+  draw_label(paste0("Subphenotype 2 (n=", n2, ", ", round(n2 / (n1 + n2) * 100), "%)"), fontface = 'bold', size = 20, x = 0.5, y = 0.2, lineheight = 1.3, color = my_palette["2"]) +
+  draw_line(x = c(0.1, 0.2), y = c(0.2, 0.2), color = my_palette["2"], linewidth = 2)
+
+survival_panel <- cowplot::plot_grid(sur_plot$plot, sur_plot$table, ncol = 1, rel_heights = c(2, 1))
+
+donut_plot_small <- wrap_elements(donut_plot) + plot_layout(widths = c(0.8))
+
+cohort_panel <- (p_label | pca_plot) / (survival_panel | donut_plot_small) +
+  plot_layout(heights = c(0.5, 1), widths = c(1.5, 0.7))
+
+
+cohort_panel
+
+# Save
+save_plot(cohort_panel, "cohort.png", w = 14, h = 7)
+```
+
+# 5) KEGG / GO enrichment (ORA)
+
+```{r kegg-go}
+list_biomarker_from_olink <- readxl::read_xlsx("data/ProteinlistOlink-Dec14.xlsx") %>%
+    mutate_if(.predicate = is.numeric, ~case_when(is.na(.) ~ 0, TRUE ~ .)) %>%  
+    mutate_if(is.character, ~case_when(is.na(.) ~ "Missing", TRUE ~ .)) %>% 
+    mutate(UniProt = case_when(UniProt == "NT-proBNP" ~ "NTproBNP", TRUE ~ UniProt)) %>%  
+    distinct(UniProt, .keep_all = TRUE) %>% 
+    dplyr::rename(ProteinName = "Protein name")
+
+adre_olink_clustered_long <- read.csv("data/ADRENOSS_Olink_Long_deid.csv") %>%
+  dplyr::filter(UniProt %in% biomarker_list_sig) %>%
+  inner_join(adre_olink_MT_clustered %>% dplyr::select(SampleID, LCA.All), by = "SampleID") %>%  
+  dplyr::rename(Cluster = LCA.All) 
+
+# biomaRt with retry (internet-dependent)
+repeat {
+  ensembl <- tryCatch(useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl"), error = function(e) NULL)
+  if (!is.null(ensembl)) break
+  message("biomaRt connection failed, retrying in 5 seconds..."); Sys.sleep(5)
+}
+
+genes <- unique(adre_olink_clustered_long$Assay)
+gene_ids <- getBM(attributes = c("hgnc_symbol","ensembl_gene_id","entrezgene_id"),
+                  filters = "hgnc_symbol",
+                  values = genes,
+                  mart = ensembl) %>%
+  distinct(hgnc_symbol, .keep_all = TRUE)
+
+adre_olink_clustered_long <- adre_olink_clustered_long %>%
+  dplyr::select(SampleID, Cluster, everything()) %>%
+  mutate(Cluster = factor(Cluster)) %>% 
+  inner_join(gene_ids, by = c("Assay" = "hgnc_symbol"))
+
+wilcox_results <- olink_wilcox(
+  df = adre_olink_clustered_long %>% dplyr::select(SampleID, Assay, UniProt, NPX, Cluster, OlinkID, Panel),
+  variable = "Cluster", 
+  alternative = "two.sided"
+) %>% 
+  dplyr::select(Assay, UniProt, OlinkID, Panel, p.value, Adjusted_pval, Threshold) %>%
+  arrange(Adjusted_pval)
+
+adr_pathway_data <- adre_olink_clustered_long %>%
+  group_by(Cluster, UniProt, GeneName, entrezgene_id) %>%  
+  summarize(Mean_NPX = mean(NPX), .groups = 'drop') %>%
+  tidyr::pivot_wider(names_from = Cluster, values_from = Mean_NPX, names_prefix = "Cluster_") %>%
+  mutate(Log2FC = Cluster_1 - Cluster_2) %>%  
+  inner_join(wilcox_results %>% dplyr::select(UniProt, Adjusted_pval), by = "UniProt")
+
+all_significant_genes_filtered <- adr_pathway_data %>% filter(Adjusted_pval < 0.05) %>% pull(entrezgene_id) %>% unique()
+cl1_significant_genes_filtered <- adr_pathway_data %>% filter(Adjusted_pval < 0.05 & Log2FC > 0) %>% pull(entrezgene_id) %>% unique()
+cl2_significant_genes_filtered <- adr_pathway_data %>% filter(Adjusted_pval < 0.05 & Log2FC < 0) %>% pull(entrezgene_id) %>% unique()
+
+adre_KEGG <- enrichKEGG(
+  gene = all_significant_genes_filtered, organism = "hsa",
+  minGSSize = 10, pvalueCutoff = 0.05, pAdjustMethod = "BH"
+) %>% setReadable(., org.Hs.eg.db, keyType = "ENTREZID")
+
+
+# (Optional) GO examples
+adre_GO  <- enrichGO(gene = cl1_significant_genes_filtered, OrgDb = org.Hs.eg.db,
+                     keyType = "ENTREZID", ont = "BP", minGSSize = 10,
+                     pvalueCutoff = 0.05, pAdjustMethod = "BH") %>%
+            setReadable(., OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+
+fc_vector <- adr_pathway_data$Log2FC; names(fc_vector) <- adr_pathway_data$GeneName
+fc_vector <- fc_vector[!is.na(fc_vector) & !duplicated(names(fc_vector))]
+
+p_kegg_dot <- enrichplot::dotplot(adre_KEGG, showCategory = 20) + ggtitle("KEGG Dotplot")
+p_kegg_emap <- enrichplot::emapplot(pairwise_termsim(adre_KEGG), showCategory = 20, layout = "kk") + ggtitle("KEGG Emap")
+
+kegg_plot <- (p_kegg_dot | p_kegg_emap) + patchwork::plot_layout(widths = c(.8, 1.2))
+
+kegg_plot
+# Save
+save_plot(kegg_plot, "kegg_plot.png", w = 8, h = 10)
+```
+
+# 6) Volcano + PAC + Figure 1
+
+## 6.1) Volcano Plot
+```{r Volcano plot}
+# EnhancedVolcano on combined table
+deseq.volcano <- function(res, datasetName, print_plot = TRUE) {
+  res$Adjusted_pval_log10 <- -log10(pmax(res$Adjusted_pval, 1e-10))
+  p <- EnhancedVolcano(
+    res, x = 'Log2FC', y = 'Adjusted_pval', lab = rownames(res),
+    title = paste(datasetName, "KEGG Pathway Analysis"),
+    subtitle = bquote(italic('FDR <= 0.05 and absolute FC >= 2')),
+    labSize = 3, pointSize = 1.5, axisLabSize = 10,
+    titleLabSize = 12, subtitleLabSize = 8, captionLabSize = 10,
+    legendPosition = "none", pCutoff = 0.05, FCcutoff = 1
+  )
+  if (print_plot) print(p)
+  invisible(p)
+}
+
+# Volcano using olink_volcano_plot
+wilcox_results_vol_adre <- wilcox_results %>%
+  inner_join(adr_pathway_data %>% dplyr::select(UniProt, Log2FC), by = "UniProt") %>%
+  dplyr::rename(estimate = "Log2FC")
+
+vol_plot <- wilcox_results_vol_adre %>%
+  olink_volcano_plot() +
+  geom_text_repel(aes(label = UniProt), max.overlaps = 0, fontface = "bold") +  
+  labs(title = NULL, x = expression(Log[2]*"FC"), y = expression(-Log[10]*"(p-value)")) + 
+  theme(
+    plot.title = element_text(color = "red", face = "bold", size = 26), 
+    legend.position = c(0.98, 0.02),
+    legend.justification = c("right", "bottom"),
+    legend.background = element_rect(fill = "white", color = "black"),
+    legend.box.margin = ggplot2::margin(t = 0),
+    legend.title = element_blank(),
+    legend.text = element_text(size=21, color = "black"),
+    axis.title = element_text(size = 22, face = "bold", color = "black"),
+    axis.text = element_text(color = "black", size = 21)
+  )
+
+vol_plot 
+```
+
+## 6.2) PAC plot
+
+```{r PAC plot}
+k_vals <- 2:6
+pac_df <- data.frame(k = k_vals, PAC = adre_pac*100)
+best_row <- pac_df[which.min(pac_df$PAC), ]
+
+p_pac <- ggplot(pac_df, aes(x = k, y = PAC)) +
+  geom_line(color = "blue", linewidth = 1.1) +
+  geom_point(color = "red", size = 3) +
+  geom_point(data = best_row, aes(x = k, y = PAC), shape = 21, fill = NA, size = 4, stroke = 1, color = "blue") +
+  geom_vline(xintercept = best_row$k, linetype = "dashed", color = "red", linewidth = .8) +
+  labs(x = "Number of Clusters (k)", y = "PAC Score") +
+  ylim(30, 65) +  
+  theme(
+    panel.background = element_rect(fill = "white", color = NA),
+    axis.line = element_line(color = "black"),
+    axis.text = element_text(color = "black", size = 16),
+    axis.title = element_text(color = "black", size = 20, face = "bold"),
+    legend.position = "none",
+    plot.title = element_blank()
+  )
+p_pac
+```
+
+## 6.3) Figure 1 — Combine volcano + heatmap + PAC
+
+```{r Figure 1 - Combine Plot}
+# Use the ggplotified heatmap
+heatmap_plot_gp <- heatmap_plot_gp
+
+theme_tag <- theme(plot.tag = element_text(size = 10, face = "bold", color = "black"))
+p_pac2 <- p_pac + theme_tag + labs(tag = "A")
+heatmap_plot2 <- heatmap_plot_gp + theme_tag + labs(tag = "B")
+vol_plot2 <- vol_plot + theme_tag + labs(tag = "C")
+
+combined_plot <- p_pac2 / heatmap_plot2 / vol_plot2 +
+  plot_layout(heights = c(2.5, 4, 11))
+
+combined_plot
+
+# Save
+save_plot(combined_plot, "combined_plot.png", w = 8, h = 10)
+```
+
+```{r session-info}
+sessionInfo()
+```
