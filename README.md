@@ -1,8 +1,4 @@
-Here is a **clean, short, professional README** that clearly says this is **only the pipeline used in the manuscript and not the full internal codebase**.
 
-You can copy this directly into **README.md**.
-
----
 
 # Sepsis-AKI Subphenotype Clustering Analysis
 
