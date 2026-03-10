@@ -1,0 +1,22 @@
+# System files
+.DS_Store
+
+# Data files (patient data)
+data/
+*.csv
+*.xlsx
+*.xls
+*.rds
+*.RData
+*.feather
+*.parquet
+
+# Output files
+results/
+figures/
+*.png
+*.pdf
+
+# RStudio
+.Rhistory
+.Rproj.user
